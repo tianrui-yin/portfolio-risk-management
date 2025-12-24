@@ -344,6 +344,235 @@ def backtest_report(returns, var_estimates, confidence=0.95, var_method=''):
     return '\n'.join(lines)
 
 
+def exception_clustering(returns, var_estimates, confidence=0.95):
+    """
+    Analyse du clustering des exceptions VaR.
+
+    Étudie si les exceptions (dépassements du VaR) se regroupent
+    dans le temps, ce qui indiquerait que le modèle ne réagit pas
+    assez vite aux changements de volatilité.
+
+    Paramètres:
+    -----------
+    returns : np.array
+        Rendements réalisés
+    var_estimates : np.array
+        Estimations du VaR (positif = perte)
+    confidence : float
+        Niveau de confiance
+
+    Retourne:
+    ---------
+    dict : analyse du clustering
+        - exception_dates: indices des exceptions
+        - max_consecutive: plus longue série consécutive
+        - cluster_count: nombre de clusters
+        - average_cluster_size: taille moyenne des clusters
+        - independence_test: LR et p-value d'indépendance
+        - interpretation: interprétation textuelle
+    """
+    exc = count_exceptions(returns, var_estimates)
+    exception_indices = exc['exception_indices']
+    n = exc['total_observations']
+
+    if len(exception_indices) == 0:
+        return {
+            'exception_dates': np.array([], dtype=int),
+            'max_consecutive': 0,
+            'cluster_count': 0,
+            'average_cluster_size': 0.0,
+            'independence_test': {'lr_statistic': 0.0, 'p_value': 1.0},
+            'interpretation': 'Aucune exception détectée.',
+        }
+
+    # Construire la série binaire d'exceptions
+    exceptions_binary = np.zeros(n, dtype=int)
+    exceptions_binary[exception_indices] = 1
+
+    # Trouver les clusters (groupes consécutifs d'exceptions)
+    clusters = []
+    current_cluster = 0
+    in_cluster = False
+
+    for t in range(n):
+        if exceptions_binary[t] == 1:
+            if not in_cluster:
+                in_cluster = True
+                current_cluster = 1
+            else:
+                current_cluster += 1
+        else:
+            if in_cluster:
+                clusters.append(current_cluster)
+                in_cluster = False
+                current_cluster = 0
+
+    # Fermer le dernier cluster si nécessaire
+    if in_cluster:
+        clusters.append(current_cluster)
+
+    max_consecutive = max(clusters) if clusters else 0
+    cluster_count = len(clusters)
+    average_cluster_size = np.mean(clusters) if clusters else 0.0
+
+    # Test d'indépendance de Christoffersen (partie indépendance seule)
+    chris = christoffersen_test(returns, var_estimates, confidence)
+    independence_test = {
+        'lr_statistic': chris['lr_independence'],
+        'p_value': chris['p_value_independence'],
+    }
+
+    # Interprétation
+    if max_consecutive >= 3 or chris['p_value_independence'] < 0.05:
+        interpretation = (
+            f"Clustering détecté: {cluster_count} cluster(s), "
+            f"max consécutif = {max_consecutive}. "
+            f"Le modèle ne s'adapte pas assez vite aux changements de volatilité."
+        )
+    else:
+        interpretation = (
+            f"Pas de clustering significatif: {cluster_count} cluster(s), "
+            f"max consécutif = {max_consecutive}. "
+            f"Les exceptions semblent indépendantes."
+        )
+
+    return {
+        'exception_dates': exception_indices,
+        'max_consecutive': max_consecutive,
+        'cluster_count': cluster_count,
+        'average_cluster_size': average_cluster_size,
+        'independence_test': independence_test,
+        'interpretation': interpretation,
+    }
+
+
+def lookback_sensitivity(returns, confidence=0.95,
+                          lookback_periods=None):
+    """
+    Analyse de sensibilité au lookback period.
+
+    Teste comment le VaR et les résultats de backtesting changent
+    en fonction de la fenêtre d'estimation.
+
+    Paramètres:
+    -----------
+    returns : np.array
+        Rendements historiques
+    confidence : float
+        Niveau de confiance
+    lookback_periods : list
+        Périodes de lookback à tester (défaut: [125, 250, 500, 750, 1000])
+
+    Retourne:
+    ---------
+    pd.DataFrame : lookback, var_95, var_99, exception_rate, kupiec_pvalue
+    """
+    import pandas as pd
+    from scipy.stats import norm
+
+    if lookback_periods is None:
+        lookback_periods = [125, 250, 500, 750, 1000]
+
+    returns = np.array(returns)
+    n = len(returns)
+    z_95 = norm.ppf(0.95)
+    z_99 = norm.ppf(0.99)
+
+    rows = []
+    for lookback in lookback_periods:
+        if lookback >= n:
+            continue
+
+        # Utiliser les 'lookback' derniers jours pour estimer σ
+        recent = returns[-lookback:]
+        sigma = np.std(recent, ddof=1)
+
+        var_95 = z_95 * sigma
+        var_99 = z_99 * sigma
+
+        # Backtesting: VaR glissant sur la période hors-échantillon
+        n_out = n - lookback
+        if n_out < 10:
+            rows.append({
+                'lookback': lookback,
+                'var_95': var_95,
+                'var_99': var_99,
+                'exception_rate': np.nan,
+                'kupiec_pvalue': np.nan,
+            })
+            continue
+
+        # VaR glissant
+        var_rolling = np.zeros(n_out)
+        z_conf = norm.ppf(confidence)
+        for t in range(n_out):
+            sigma_t = np.std(returns[t:t + lookback], ddof=1)
+            var_rolling[t] = z_conf * sigma_t
+
+        returns_test = returns[lookback:]
+        losses = -returns_test
+        exceptions = losses > var_rolling
+        exception_rate = np.mean(exceptions)
+
+        # Kupiec test
+        kupiec = kupiec_test(returns_test, var_rolling, confidence)
+
+        rows.append({
+            'lookback': lookback,
+            'var_95': var_95,
+            'var_99': var_99,
+            'exception_rate': exception_rate,
+            'kupiec_pvalue': kupiec['p_value'],
+        })
+
+    return pd.DataFrame(rows)
+
+
+def confidence_sensitivity(returns, var_estimates_by_confidence,
+                            confidence_levels=None):
+    """
+    Analyse de sensibilité au niveau de confiance.
+
+    Paramètres:
+    -----------
+    returns : np.array
+        Rendements réalisés
+    var_estimates_by_confidence : dict
+        {confidence_level: var_estimates_array}
+    confidence_levels : list
+        Niveaux de confiance à tester
+
+    Retourne:
+    ---------
+    dict : résultats par niveau de confiance
+        {0.95: {'exception_rate': ..., 'kupiec': ..., 'expected_rate': ...}, ...}
+    """
+    if confidence_levels is None:
+        confidence_levels = [0.90, 0.95, 0.975, 0.99]
+
+    returns = np.array(returns)
+    results = {}
+
+    for conf in confidence_levels:
+        if conf not in var_estimates_by_confidence:
+            continue
+
+        var_estimates = np.array(var_estimates_by_confidence[conf])
+        exc = count_exceptions(returns, var_estimates)
+
+        kupiec = kupiec_test(returns, var_estimates, conf)
+
+        results[conf] = {
+            'exception_rate': exc['exception_rate'],
+            'n_exceptions': exc['n_exceptions'],
+            'expected_rate': 1 - conf,
+            'expected_exceptions': len(returns) * (1 - conf),
+            'kupiec': kupiec,
+        }
+
+    return results
+
+
 # Tests si exécuté directement
 if __name__ == "__main__":
     # Générer des données de test
